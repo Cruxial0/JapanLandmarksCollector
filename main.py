@@ -22,19 +22,16 @@ WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
 
 # User-Agent header to comply with Wikimedia User-Agent Policy
 # Format: <tool-name>/<version> (<contact-info>) <library>/<version>
-# Replace YOUR_EMAIL with your actual email for the contact field
 USER_AGENT = "JapanLandmarksCollector/1.0 (https://github.com/Cruxial0/JapanLandmarksCollector; your.email@example.com) python-requests/2.31"
 
-# Request headers with proper User-Agent
 HEADERS = {
     "Accept": "application/sparql-results+json",
     "User-Agent": USER_AGENT
 }
 
-# Rate limiting (Wikimedia recommends max 200 requests per second, but we'll be much more conservative)
-REQUEST_DELAY = 0.2  # seconds between requests
+# Rate limiting (Wikimedia recommends max 200 requests per second)
+REQUEST_DELAY = 0.2 
 
-# Major city threshold (prefecture capitals or cities above this population)
 MAJOR_CITY_POPULATION_THRESHOLD = 290000
 
 # OpenRouter configuration
@@ -55,9 +52,9 @@ DEFAULT_WEB_SEARCH_PROMPT = """A web search was conducted. Use the following web
 # Cache configuration
 DEFAULT_CACHE_FILE = "wikidata_cache.json"
 CACHE_VERSION = "1.0"
-DEFAULT_CACHE_EXPIRY_DAYS = 7  # Cache expires after 7 days
+DEFAULT_CACHE_EXPIRY_DAYS = 7
 
-# Enhanced SPARQL query for mountains, lakes, and Shinto shrines with Wikipedia links, images, and OSM data
+# SPARQL query for mountains, lakes, and Shinto shrines with Wikipedia links, images, and OSM data
 LANDMARK_QUERY = """
 SELECT ?item ?itemLabel ?coordinate ?typeLabel ?wikipedia ?image ?osmNode WHERE {
   VALUES ?type { wd:Q8502 wd:Q23397 wd:Q845945 }  # mountain, lake, Shinto shrine
@@ -81,7 +78,7 @@ SELECT ?item ?itemLabel ?coordinate ?typeLabel ?wikipedia ?image ?osmNode WHERE 
 }
 """
 
-# Enhanced SPARQL query for current towns/cities in Japan with Wikipedia links and images
+# SPARQL query for current towns/cities in Japan with Wikipedia links and images
 TOWN_QUERY = """
 SELECT DISTINCT ?town ?townLabel ?coordinate ?prefectureLabel ?population ?pointInTime ?isCapital ?wikipedia ?image WHERE {
   # Get current cities/towns only (not historical)
@@ -157,7 +154,6 @@ def load_cache(cache_file: str) -> Dict:
         with open(cache_file, 'r', encoding='utf-8') as f:
             cache = json.load(f)
             
-        # Validate cache version
         if cache.get("version") != CACHE_VERSION:
             print(f"  ⚠️  Cache version mismatch. Creating new cache.")
             return {
@@ -225,7 +221,6 @@ def clean_prefecture_name(prefecture: str) -> str:
     if not prefecture:
         return ""
     
-    # Remove common suffixes
     cleaned = prefecture
     suffixes_to_remove = [" Prefecture", " prefecture", "県", "-ken", " Ken"]
     for suffix in suffixes_to_remove:
@@ -233,7 +228,6 @@ def clean_prefecture_name(prefecture: str) -> str:
             cleaned = cleaned[:-len(suffix)]
             break
     
-    # Romanize the cleaned name
     cleaned = romanize_name(cleaned.strip())
     
     return cleaned
@@ -242,18 +236,15 @@ def clean_landmark_name(name: str) -> str:
     """Remove common geographical identifiers from landmark names."""
     clean_name = name
     
-    # Remove prefixes
     for pattern in NAME_PATTERNS['prefixes']:
         clean_name = re.sub(pattern, '', clean_name, flags=re.IGNORECASE)
     
-    # Remove suffixes
     for pattern in NAME_PATTERNS['suffixes']:
         clean_name = re.sub(pattern, '', clean_name, flags=re.IGNORECASE)
     
-    # Clean up whitespace
     clean_name = clean_name.strip()
     
-    # If we completely stripped the name, return the original
+    # If the clean name is blank, return the original name
     return clean_name if clean_name else name
 
 def fetch_wikidata(query: str, description: str = "Fetching data", delay: bool = True, 
@@ -261,7 +252,6 @@ def fetch_wikidata(query: str, description: str = "Fetching data", delay: bool =
                    force_refresh: bool = False) -> Dict:
     """Fetch data from Wikidata with retry logic, rate limiting, and caching."""
     
-    # Check cache first if provided
     if cache is not None and not force_refresh:
         cache_key = get_cache_key(query)
         if cache_key in cache["data"]:
@@ -272,7 +262,6 @@ def fetch_wikidata(query: str, description: str = "Fetching data", delay: bool =
     
     max_retries = 3
     
-    # Add delay to respect rate limits
     if delay:
         time.sleep(REQUEST_DELAY)
     
@@ -373,7 +362,7 @@ async def call_openrouter_async(
     model: str = DEFAULT_OPENROUTER_MODEL,
     max_tokens: int = 500,
     semaphore: asyncio.Semaphore = None,
-    web_search_prompt: Optional[str] = None  # Now this should work!
+    web_search_prompt: Optional[str] = None
 ) -> Optional[str]:
     """Call OpenRouter API asynchronously to generate a summary."""
     if not content:
@@ -423,7 +412,6 @@ async def call_openrouter_async(
                         result = await retry_response.json()
                         return result['choices'][0]['message']['content'].strip()
                 
-                # Handle errors with detailed logging
                 if response.status >= 400:
                     error_text = await response.text()
                     try:
@@ -455,7 +443,7 @@ async def generate_summary_for_item(
     model: str,
     semaphore: asyncio.Semaphore,
     is_city: bool = False,
-    web_search_prompt: Optional[str] = None  # REMOVED enable_web_search
+    web_search_prompt: Optional[str] = None
 ) -> Tuple[Dict, bool]:
     """Generate a summary for a single item (landmark or city)."""
     wiki_url = item.get("wikipedia_url")
@@ -489,7 +477,7 @@ async def generate_summaries_parallel(
     model: str,
     concurrency: int,
     item_type: str = "landmarks",
-    web_search_prompt: Optional[str] = None  # REMOVED enable_web_search
+    web_search_prompt: Optional[str] = None
 ) -> Tuple[List[Dict], int, int]:
     """Generate LLM summaries for multiple items in parallel."""
     
@@ -586,7 +574,7 @@ def generate_llm_summaries(
                     model,
                     concurrency,
                     "landmarks",
-                    web_search_prompt=web_search_prompt  # PASS IT THROUGH
+                    web_search_prompt=web_search_prompt
                 )
             )
         finally:
@@ -622,7 +610,7 @@ def generate_city_summaries(
     prompt_template: str,
     model: str = DEFAULT_OPENROUTER_MODEL,
     concurrency: int = OPENROUTER_CONCURRENCY,
-    web_search_prompt: Optional[str] = None  # NEW PARAMETER
+    web_search_prompt: Optional[str] = None
 ) -> List[Dict]:
     """Generate LLM summaries for cities with Wikipedia URLs using parallel processing."""
     cities_dict = {}
@@ -654,7 +642,7 @@ def generate_city_summaries(
                     model,
                     concurrency,
                     "cities",
-                    web_search_prompt=web_search_prompt  # PASS IT THROUGH
+                    web_search_prompt=web_search_prompt
                 )
             )
         finally:
@@ -732,7 +720,7 @@ def parse_landmarks(results: Dict) -> List[Dict]:
 
 def parse_towns(results: Dict) -> List[Dict]:
     """Parse town/city data from SPARQL results and deduplicate."""
-    towns_dict = {}  # Use dict to deduplicate by name
+    towns_dict = {}
     items = results["results"]["bindings"]
     skipped_populations = 0
     skipped_null_pop = 0
@@ -751,44 +739,35 @@ def parse_towns(results: Dict) -> List[Dict]:
             lon, lat = coords
             
             town_name = item["townLabel"]["value"]
-            # Clean prefecture name
             prefecture_raw = item.get("prefectureLabel", {}).get("value", "")
             prefecture = clean_prefecture_name(prefecture_raw)
             
-            # Check if it's a capital
             is_capital = item.get("isCapital", {}).get("value", "") == "true"
             
-            # Get Wikipedia URL
             wikipedia_url = item.get("wikipedia", {}).get("value", "")
             
-            # Get image URL
             image_url = item.get("image", {}).get("value", "")
             
-            # Parse population safely
             population = None
             point_in_time = None
             
             if "population" in item:
                 pop_value = item["population"]["value"]
                 try:
-                    # Try to parse as float first (handles both int and decimal), then convert to int
                     if not pop_value.startswith("http"):  # Skip URIs
                         population = int(float(pop_value))
-                        # Get the date if available
                         if "pointInTime" in item:
                             point_in_time = item["pointInTime"]["value"]
                 except (ValueError, TypeError):
                     skipped_populations += 1
-                    pass  # Keep population as None if conversion fails
+                    pass
             
             if population is None:
                 skipped_null_pop += 1
                 continue  # Skip items with null population
             
-            # Create unique key for deduplication (name + prefecture + coordinates)
             town_key = f"{town_name}_{prefecture}_{round(float(lat), 3)}_{round(float(lon), 3)}"
             
-            # If we already have this town, keep the one with the most recent/largest population
             if town_key in towns_dict:
                 existing = towns_dict[town_key]
                 # Prefer the entry with:
@@ -812,10 +791,8 @@ def parse_towns(results: Dict) -> List[Dict]:
                     should_replace = True
                 elif population is not None and existing.get("population") is not None:
                     if point_in_time and existing.get("point_in_time"):
-                        # Compare dates (more recent is better)
                         should_replace = point_in_time > existing.get("point_in_time", "")
                     else:
-                        # Compare population (higher is likely more recent)
                         should_replace = population > existing.get("population", 0)
                 elif population is not None and not existing.get("population"):
                     should_replace = True
@@ -832,19 +809,17 @@ def parse_towns(results: Dict) -> List[Dict]:
                 "is_capital": is_capital,
                 "wikipedia_url": wikipedia_url,
                 "image_url": image_url,
-                "point_in_time": point_in_time  # Keep for deduplication, won't include in output
+                "point_in_time": point_in_time
             }
             
             towns_dict[town_key] = town_data
         except (ValueError, KeyError, IndexError) as e:
-            # Skip towns with invalid or missing coordinates
             skipped_coords += 1
             continue
     
-    # Convert back to list and remove point_in_time
     towns = []
     for town in towns_dict.values():
-        town.pop("point_in_time", None)  # Remove internal field
+        town.pop("point_in_time", None)
         towns.append(town)
     
     if skipped_coords > 0:
@@ -854,7 +829,6 @@ def parse_towns(results: Dict) -> List[Dict]:
     if skipped_null_pop > 0:
         print(f"  ⚠️  Skipped {skipped_null_pop} towns with null population")
     
-    # Count major cities and those with Wikipedia/images
     major_cities = [t for t in towns if t.get("is_capital") or (t.get("population") is not None and t.get("population") > MAJOR_CITY_POPULATION_THRESHOLD)]
     cities_with_wiki = [t for t in towns if t.get("wikipedia_url")]
     cities_with_images = [t for t in towns if t.get("image_url")]
@@ -912,17 +886,14 @@ def fetch_additional_images(landmarks: List[Dict], skip_additional: bool = False
                                             cache_expiry_days=cache_expiry_days,
                                             force_refresh=force_refresh)
                 
-                # Map results back to landmarks
                 for binding in results["results"]["bindings"]:
                     item_id = binding["item"]["value"].split("/")[-1]
                     if "category" in binding:
-                        # Find the corresponding landmark
                         for lm in batch:
                             if lm["wikidata_id"] == item_id:
                                 lm["commons_category"] = binding["category"]["value"]
                                 break
                 
-                # Add delay between batches only if not using cache
                 if not use_cached:
                     time.sleep(REQUEST_DELAY * 2)
                 
