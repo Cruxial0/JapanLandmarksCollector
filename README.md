@@ -11,29 +11,37 @@ You can optionally enable web search by appending `:online` to the model you use
 ## Arguments
 ```
 -h, --help            show this help message and exit
-  --skip-images         Skip the additional image fetching step
-  --output OUTPUT       Output filename (default: japan_landmarks.json)
-  --email EMAIL         Your email for the User-Agent header (required by Wikimedia)
-  --generate-summaries  Generate LLM summaries for landmarks using OpenRouter
-  --openrouter-api-key OPENROUTER_API_KEY
-                        OpenRouter API key for LLM summarization
-  --llm-model LLM_MODEL
-                        OpenRouter model to use (default: x-ai/grok-4-fast:online)
-  --llm-prompt LLM_PROMPT
-                        Prompt template for LLM (use {wikipedia_content} as placeholder)
-  --llm-concurrency LLM_CONCURRENCY
-                        Number of parallel LLM requests (default: 5)
-  --generate-city-summaries
-                        Generate LLM summaries for cities/towns (requires --generate-summaries)
-  --enable-web-search   Enable OpenRouter web search plugin for additional research
-  --web-search-prompt WEB_SEARCH_PROMPT
-                        Custom prompt for web search results (overrides OpenRouter default)
-  --cache-file CACHE_FILE
-                        Cache file location (default: wikidata_cache.json)
-  --cache-expiry-days CACHE_EXPIRY_DAYS
-                        Number of days before cache expires (default: 7)
-  --no-cache            Disable caching (fetch all data fresh)
-  --force-refresh       Force refresh all cached data
+--output OUTPUT       Output filename (default: output/japan_landmarks.json)
+--email EMAIL         Your email for the User-Agent header (required by Wikimedia)
+--landmark-types {mountain,lake,shrine,cave,bridge,park} [{mountain,lake,shrine,cave,bridge,park} ...]
+                      Specific landmark types to fetch (default: all). Choices: mountain, lake, shrine, cave, bridge, park
+--generate-summaries  Generate LLM summaries for landmarks using OpenRouter
+--openrouter-api-key OPENROUTER_API_KEY
+                      OpenRouter API key for LLM summarization
+--llm-model LLM_MODEL
+                      OpenRouter model to use (default: x-ai/grok-4-fast:online)
+--llm-prompt LLM_PROMPT
+                      Prompt template for LLM (use {formatted_facts} as placeholder)
+--llm-concurrency LLM_CONCURRENCY
+                      Number of parallel LLM requests (default: 5)
+--generate-city-summaries
+                      Generate LLM summaries for cities/towns (requires --generate-summaries)
+--enable-web-search   Enable OpenRouter web search plugin for additional research
+--web-search-prompt WEB_SEARCH_PROMPT
+                      Custom prompt for web search results
+--geonames-username GEONAMES_USERNAME
+                      GeoNames username for fact gathering
+--flickr-api-key FLICKR_API_KEY
+                      Flickr API key for image gathering
+--unsplash-api-key UNSPLASH_API_KEY
+                      Unsplash API key for image gathering
+--gather-images       Enable multi-source image gathering (Wikimedia Commons, Flickr, Unsplash)
+--cache-file CACHE_FILE
+                      Cache file location (default: cache/wikidata_cache.json)
+--cache-expiry-days CACHE_EXPIRY_DAYS
+                      Number of days before cache expires (default: 7)
+--no-cache            Disable caching (fetch all data fresh)
+--force-refresh       Force refresh all cached data
 ```
 
 ## Usage
@@ -65,3 +73,8 @@ python main.py --email myemail@domain.com \
     --llm-model x-ai/grok-4-fast:online \
     --openrouter-api-key sk-v1-... # Required for LLM summarization
 ```
+
+### Statistics
+Running the current state of the script:
+- Takes about 2-2.5h (with default rate limits)
+- Costs about $2 for LLM summaries (Using `grok-4-fast:online`)

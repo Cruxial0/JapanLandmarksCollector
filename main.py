@@ -16,12 +16,22 @@ import os
 import hashlib
 import numpy as np
 from scipy.spatial import KDTree
+from pathlib import Path
+
+from src.fact_gathering import (
+    gather_facts_for_landmark,
+    format_facts_for_llm,
+    FACT_SOURCES
+)
+from src.image_gathering import (
+    enrich_landmarks_with_images,
+    IMAGE_SOURCES
+)
 
 # Wikidata SPARQL endpoint
 WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
 
 # User-Agent header to comply with Wikimedia User-Agent Policy
-# Format: <tool-name>/<version> (<contact-info>) <library>/<version>
 USER_AGENT = "JapanLandmarksCollector/1.0 (https://github.com/Cruxial0/JapanLandmarksCollector; your.email@example.com) python-requests/2.31"
 
 HEADERS = {
@@ -37,109 +47,179 @@ MAJOR_CITY_POPULATION_THRESHOLD = 290000
 # OpenRouter configuration
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_OPENROUTER_MODEL = "x-ai/grok-4-fast:online"
-DEFAULT_PROMPT_TEMPLATE = """Please provide a concise one-paragraph summary of this location based on the following Wikipedia content. Focus on highlighting fun/interesting facts, as well as some very brief history and why it might be worth visiting.
 
-NOTE: THE SUMMARY HAS TO BE LESS THAN 1024 CHARACTERS! THIS IS EXTREMELY IMPORTANT!
+# Prompt template
+DEFAULT_PROMPT_TEMPLATE = """Based on the comprehensive information provided from multiple verified sources, create a compelling one-paragraph summary (under 1024 characters) of this location.
 
-Wikipedia content:
-{wikipedia_content}
+Focus on:
+- The most unique and interesting aspects
+- Specific facts (dates, numbers, names, measurements)
+- Why it's culturally or historically significant
+- What makes it worth visiting
+- Any anime/pop culture connections if mentioned in the sources
+
+Important: Only include information that appears in the provided sources. Do not make anything up.
+
+{formatted_facts}
 
 Summary:"""
+
 OPENROUTER_CONCURRENCY = 5  # Number of parallel requests
 
 DEFAULT_WEB_SEARCH_PROMPT = """A web search was conducted. Use the following web search results to supplement your response with additional information. Integrate the information naturally into your summary WITHOUT including citations or source links."""
 
 # Cache configuration
-DEFAULT_CACHE_FILE = "wikidata_cache.json"
+DEFAULT_CACHE_FILE = "cache/wikidata_cache.json"
 CACHE_VERSION = "1.0"
 DEFAULT_CACHE_EXPIRY_DAYS = 7
 
-# SPARQL query for mountains, lakes, and Shinto shrines with Wikipedia links, images, and OSM data
-LANDMARK_QUERY = """
-SELECT ?item ?itemLabel ?coordinate ?typeLabel ?wikipedia ?image ?osmNode WHERE {
-  VALUES ?type { wd:Q8502 wd:Q23397 wd:Q845945 }  # mountain, lake, Shinto shrine
+# Landmark configuration
+# Objects added here will automatically be queried and processed as a landmark (assuming they have valid coordinates)
+LANDMARK_TYPES = {
+    'mountain': {
+        'wikidata_id': 'Q8502',
+        'display_name': 'Mountain',
+        'name_patterns': {
+            'prefixes': [r'^Mount\s+', r'^Mt\.?\s+'],
+            'suffixes': [
+                r'-yama$', r'-san$', r'-dake$', r'-take$', r'-mine$', r'-zan$',
+                r'山$', r'岳$', r'峰$', r'\s+Mountain$', r'\s+Peak$'
+            ]
+        }
+    },
+    'lake': {
+        'wikidata_id': 'Q23397',
+        'display_name': 'Lake',
+        'name_patterns': {
+            'prefixes': [r'^Lake\s+'],
+            'suffixes': [r'-ko$', r'-ike$', r'-numa$', r'湖$', r'池$', r'沼$', r'\s+Lake$']
+        }
+    },
+    'shrine': {
+        'wikidata_id': 'Q845945',
+        'display_name': 'Shinto Shrine',
+        'name_patterns': {
+            'prefixes': [],
+            'suffixes': [r'-jinja$', r'-taisha$', r'-gū$', r'神社$', r'大社$', r'宮$', r'\s+Shrine$']
+        }
+    },
+    'cave': {
+        'wikidata_id': 'Q35509',
+        'display_name': 'Cave',
+        'name_patterns': {
+            'prefixes': [],
+            'suffixes': [r'-do$', r'-dokutsu$', r'洞$', r'洞窟$', r'\s+Cave$', r'\s+Cavern$']
+        }
+    },
+    'bridge': {
+        'wikidata_id': 'Q12280',
+        'display_name': 'Bridge',
+        'name_patterns': {
+            'prefixes': [],
+            'suffixes': [r'-bashi$', r'-hashi$', r'-kyō$', r'橋$', r'\s+Bridge$']
+        }
+    },
+    'park': {
+        'wikidata_id': 'Q22698',
+        'display_name': 'Park',
+        'name_patterns': {
+            'prefixes': [],
+            'suffixes': [r'-kōen$', r'-en$', r'公園$', r'園$', r'\s+Park$', r'\s+Garden$']
+        }
+    }
+}
+
+GENERIC_NAME_PATTERNS = {
+    'prefixes': [r'^御', r'^小', r'^大', r'^新', r'^北', r'^南', r'^東', r'^西'],
+    'suffixes': []
+}
+
+def build_landmark_query(landmark_types: Dict = None) -> str:
+    """Dynamically build SPARQL query based on configured landmark types."""
+    if landmark_types is None:
+        landmark_types = LANDMARK_TYPES
+    
+    wikidata_ids = [f"wd:{config['wikidata_id']}" for config in landmark_types.values()]
+    values_clause = " ".join(wikidata_ids)
+    
+    type_names = [config['display_name'] for config in landmark_types.values()]
+    comment = ", ".join(type_names)
+    
+    query = f"""
+SELECT ?item ?itemLabel ?coordinate ?typeLabel ?wikipedia ?wikivoyage ?image ?osmNode ?wikidata WHERE {{
+  VALUES ?type {{ {values_clause} }}  # {comment}
   ?item wdt:P31 ?type;
         wdt:P17 wd:Q17;
         wdt:P625 ?coordinate.
   
   # Get Wikipedia article
-  OPTIONAL {
+  OPTIONAL {{
     ?wikipedia schema:about ?item;
                schema:isPartOf <https://en.wikipedia.org/>.
-  }
+  }}
+  
+  # Get Wikivoyage article
+  OPTIONAL {{
+    ?wikivoyage schema:about ?item;
+                schema:isPartOf <https://en.wikivoyage.org/>.
+  }}
   
   # Get image from Wikimedia Commons
-  OPTIONAL { ?item wdt:P18 ?image. }
+  OPTIONAL {{ ?item wdt:P18 ?image. }}
   
-  # Get OpenStreetMap node ID (property P11693)
-  OPTIONAL { ?item wdt:P11693 ?osmNode. }
+  # Get OpenStreetMap node ID
+  OPTIONAL {{ ?item wdt:P11693 ?osmNode. }}
   
-  SERVICE wikibase:label { bd:serviceParam wikibase:language "en,ja". }
-}
+  # Get Wikidata ID for cross-referencing
+  BIND(?item AS ?wikidata)
+  
+  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,ja". }}
+}}
 """
+    return query
 
-# SPARQL query for current towns/cities in Japan with Wikipedia links and images
 TOWN_QUERY = """
-SELECT DISTINCT ?town ?townLabel ?coordinate ?prefectureLabel ?population ?pointInTime ?isCapital ?wikipedia ?image WHERE {
-  # Get current cities/towns only (not historical)
-  ?town wdt:P31/wdt:P279* wd:Q515;  # instance of city/town
-        wdt:P17 wd:Q17;              # in Japan
-        wdt:P625 ?coordinate.         # has coordinates
+SELECT DISTINCT ?town ?townLabel ?coordinate ?prefectureLabel ?population ?pointInTime ?isCapital ?wikipedia ?image ?wikidata WHERE {
+  ?town wdt:P31/wdt:P279* wd:Q515;
+        wdt:P17 wd:Q17;
+        wdt:P625 ?coordinate.
   
-  # Filter out dissolved/abolished entities
-  FILTER NOT EXISTS { ?town wdt:P576 ?dissolved }  # no dissolved date
-  FILTER NOT EXISTS { ?town wdt:P582 ?endTime }    # no end time
+  FILTER NOT EXISTS { ?town wdt:P576 ?dissolved }
+  FILTER NOT EXISTS { ?town wdt:P582 ?endTime }
   
-  # Get the prefecture (administrative division)
   OPTIONAL {
     ?town wdt:P131+ ?prefecture.
-    ?prefecture wdt:P31 wd:Q50337.  # instance of prefecture of Japan
+    ?prefecture wdt:P31 wd:Q50337.
   }
   
-  # Check if this city is a capital of a prefecture
   OPTIONAL {
     ?prefecture wdt:P36 ?town.
     BIND(true AS ?isCapital)
   }
   
-  # Get Wikipedia article
   OPTIONAL {
     ?wikipedia schema:about ?town;
                schema:isPartOf <https://en.wikipedia.org/>.
   }
   
-  # Get image from Wikimedia Commons
   OPTIONAL { ?town wdt:P18 ?image. }
   
-  # Get the most recent population
   OPTIONAL {
     ?town p:P1082 ?popStatement.
     ?popStatement ps:P1082 ?population.
     FILTER(DATATYPE(?population) = xsd:integer || DATATYPE(?population) = xsd:decimal)
     
-    # Get the date for this population figure
     OPTIONAL {
       ?popStatement pq:P585 ?pointInTime.
     }
   }
   
+  # Get Wikidata ID for cross-referencing
+  BIND(?town AS ?wikidata)
+  
   SERVICE wikibase:label { bd:serviceParam wikibase:language "en,ja". }
 }
 """
-
-# Common identifiers to strip from names
-NAME_PATTERNS = {
-    'prefixes': [
-        r'^Mount\s+', r'^Mt\.?\s+', r'^Lake\s+', 
-        r'^御', r'^小', r'^大', r'^新', r'^北', r'^南', r'^東', r'^西'
-    ],
-    'suffixes': [
-        r'-yama$', r'-san$', r'-dake$', r'-take$', r'-mine$', r'-zan$',
-        r'-ko$', r'-ike$', r'-numa$', r'-gawa$', r'-kawa$',
-        r'山$', r'岳$', r'峰$', r'湖$', r'池$', r'沼$', r'川$',
-        r'\s+Mountain$', r'\s+Lake$', r'\s+River$', r'\s+Peak$'
-    ]
-}
 
 def load_cache(cache_file: str) -> Dict:
     """Load cache from file if it exists and is valid."""
@@ -198,22 +278,14 @@ def get_cache_key(query: str) -> str:
 
 def romanize_name(name: str) -> str:
     """Convert name to ASCII-only characters (romanization)."""
-    # First, normalize the unicode string
     normalized = unicodedata.normalize('NFKD', name)
-    
-    # Remove non-ASCII characters
     ascii_only = normalized.encode('ascii', 'ignore').decode('ascii')
-    
-    # Clean up extra spaces and return
     ascii_only = ' '.join(ascii_only.split())
     
-    # If the result is empty, try a different approach
     if not ascii_only or ascii_only.isspace():
-        # Keep only ASCII letters, numbers, spaces, and basic punctuation
         ascii_only = ''.join(c for c in name if ord(c) < 128)
         ascii_only = ' '.join(ascii_only.split())
     
-    # If still empty, return the original name
     return ascii_only if ascii_only else name
 
 def clean_prefecture_name(prefecture: str) -> str:
@@ -232,20 +304,42 @@ def clean_prefecture_name(prefecture: str) -> str:
     
     return cleaned
 
-def clean_landmark_name(name: str) -> str:
+def clean_landmark_name(name: str, landmark_type: str = None) -> str:
     """Remove common geographical identifiers from landmark names."""
     clean_name = name
     
-    for pattern in NAME_PATTERNS['prefixes']:
+    for pattern in GENERIC_NAME_PATTERNS['prefixes']:
         clean_name = re.sub(pattern, '', clean_name, flags=re.IGNORECASE)
     
-    for pattern in NAME_PATTERNS['suffixes']:
+    for pattern in GENERIC_NAME_PATTERNS['suffixes']:
         clean_name = re.sub(pattern, '', clean_name, flags=re.IGNORECASE)
+    
+    if landmark_type and landmark_type in LANDMARK_TYPES:
+        type_patterns = LANDMARK_TYPES[landmark_type].get('name_patterns', {})
+        
+        for pattern in type_patterns.get('prefixes', []):
+            clean_name = re.sub(pattern, '', clean_name, flags=re.IGNORECASE)
+        
+        for pattern in type_patterns.get('suffixes', []):
+            clean_name = re.sub(pattern, '', clean_name, flags=re.IGNORECASE)
     
     clean_name = clean_name.strip()
     
-    # If the clean name is blank, return the original name
     return clean_name if clean_name else name
+
+def get_landmark_type_key(type_label: str) -> str:
+    """Get the landmark type key from a Wikidata type label."""
+    type_label_lower = type_label.lower()
+    
+    for key, config in LANDMARK_TYPES.items():
+        if config['display_name'].lower() == type_label_lower:
+            return key
+    
+    for key, config in LANDMARK_TYPES.items():
+        if type_label_lower in config['display_name'].lower() or config['display_name'].lower() in type_label_lower:
+            return key
+    
+    return type_label_lower.replace(' ', '_')
 
 def fetch_wikidata(query: str, description: str = "Fetching data", delay: bool = True, 
                    cache: Optional[Dict] = None, cache_expiry_days: int = DEFAULT_CACHE_EXPIRY_DAYS,
@@ -276,7 +370,6 @@ def fetch_wikidata(query: str, description: str = "Fetching data", delay: bool =
             response.raise_for_status()
             results = response.json()
             
-            # Cache the results if cache is provided
             if cache is not None:
                 cache_key = get_cache_key(query)
                 cache["data"][cache_key] = {
@@ -288,8 +381,8 @@ def fetch_wikidata(query: str, description: str = "Fetching data", delay: bool =
             return results
             
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:  # Too Many Requests
-                wait_time = (attempt + 1) * 5  # Longer wait for rate limit errors
+            if e.response.status_code == 429:
+                wait_time = (attempt + 1) * 5
                 print(f"\n⚠️  Rate limited. Waiting {wait_time} seconds...")
                 time.sleep(wait_time)
             else:
@@ -307,56 +400,9 @@ def fetch_wikidata(query: str, description: str = "Fetching data", delay: bool =
             else:
                 raise
 
-error_stats = {"timeout": 0, "http_error": 0, "empty_content": 0, "parse_error": 0}
-
-async def fetch_wikipedia_content_async(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    """Fetch and extract text content from a Wikipedia page asynchronously."""
-    if not url:
-        return None
-    
-    try:
-        headers = {"User-Agent": USER_AGENT}
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as response:
-            response.raise_for_status()
-            html = await response.text()
-            
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            content_div = soup.find('div', {'id': 'mw-content-text'})
-            if not content_div:
-                error_stats["empty_content"] += 1
-                return None
-            
-            # Remove unwanted elements
-            for element in content_div.find_all(['table', 'script', 'style', 'sup', 'div.reflist', 'div.navbox']):
-                element.decompose()
-            
-            paragraphs = content_div.find_all('p')
-            text_content = '\n\n'.join([p.get_text().strip() for p in paragraphs if p.get_text().strip()])
-            
-            if not text_content or len(text_content) < 50:
-                error_stats["empty_content"] += 1
-                return None
-            
-            max_chars = 8000
-            if len(text_content) > max_chars:
-                text_content = text_content[:max_chars] + "..."
-            
-            return text_content
-    
-    except asyncio.TimeoutError:
-        error_stats["timeout"] += 1
-        return None
-    except aiohttp.ClientError as e:
-        error_stats["http_error"] += 1
-        return None
-    except Exception as e:
-        error_stats["parse_error"] += 1
-        return None
-
 async def call_openrouter_async(
     session: aiohttp.ClientSession,
-    content: str, 
+    formatted_facts: str, 
     api_key: str, 
     prompt_template: str, 
     model: str = DEFAULT_OPENROUTER_MODEL,
@@ -365,12 +411,12 @@ async def call_openrouter_async(
     web_search_prompt: Optional[str] = None
 ) -> Optional[str]:
     """Call OpenRouter API asynchronously to generate a summary."""
-    if not content:
+    if not formatted_facts:
         return None
     
-    async with semaphore if semaphore else asyncio.Semaphore(1):
+    async with semaphore if semaphore else (contextlib.AsyncExitStack()):
         try:
-            prompt = prompt_template.format(wikipedia_content=content)
+            prompt = prompt_template.format(formatted_facts=formatted_facts)
             
             headers = {
                 "Authorization": f"Bearer {api_key}",
@@ -390,7 +436,6 @@ async def call_openrouter_async(
                 "max_tokens": max_tokens
             }
             
-            # Add web search plugin configuration if custom prompt provided
             if web_search_prompt and ":online" in model.lower():
                 payload["plugins"] = [
                     {
@@ -400,13 +445,11 @@ async def call_openrouter_async(
                 ]
             
             async with session.post(OPENROUTER_API_URL, headers=headers, json=payload) as response:
-                # Check for rate limiting
                 if response.status == 429:
                     retry_after = response.headers.get('Retry-After', '5')
                     wait_time = int(retry_after) if retry_after.isdigit() else 5
                     print(f"\n⚠️  Rate limited. Waiting {wait_time} seconds...")
                     await asyncio.sleep(wait_time)
-                    # Retry once
                     async with session.post(OPENROUTER_API_URL, headers=headers, json=payload) as retry_response:
                         retry_response.raise_for_status()
                         result = await retry_response.json()
@@ -435,27 +478,64 @@ async def call_openrouter_async(
             print(f"\n⚠️  Unexpected error during OpenRouter API call: {e}")
             return None
 
-async def generate_summary_for_item(
+async def generate_summary_for_landmark(
     session: aiohttp.ClientSession,
-    item: Dict,
+    landmark: Dict,
     api_key: str,
     prompt_template: str,
     model: str,
     semaphore: asyncio.Semaphore,
-    is_city: bool = False,
+    geonames_username: Optional[str] = None,
     web_search_prompt: Optional[str] = None
-) -> Tuple[Dict, bool]:
-    """Generate a summary for a single item (landmark or city)."""
-    wiki_url = item.get("wikipedia_url")
-    if not wiki_url:
-        return item, False
+) -> Tuple[Dict, bool, Optional[Dict]]:
+    """Generate a summary for a single landmark using multi-source fact gathering."""
     
-    wiki_content = await fetch_wikipedia_content_async(session, wiki_url)
+    gathered_facts = await gather_facts_for_landmark(
+        session,
+        landmark,
+        USER_AGENT,
+        geonames_username
+    )
     
-    if wiki_content:
+    formatted_facts = format_facts_for_llm(gathered_facts, landmark)
+    
+    landmark['fact_sources'] = gathered_facts.get('sources', [])
+    landmark['fact_source_count'] = gathered_facts.get('source_count', 0)
+    
+    fact_object = None
+    wikidata_id = landmark.get('wikidata_id')
+    
+    if wikidata_id and gathered_facts.get('facts'):
+        text_sources = {}
+        url_sources = {}
+        
+        for fact in gathered_facts['facts']:
+            source_name = fact['source']
+            
+            if fact.get('content'):
+                text_sources[source_name] = fact['content']
+            
+            if fact.get('url'):
+                url_sources[source_name] = fact['url']
+            
+            if fact.get('infobox'):
+                text_sources[f'{source_name}_infobox'] = str(fact['infobox'])
+            if fact.get('tags'):
+                text_sources[f'{source_name}_tags'] = str(fact['tags'])
+        
+        fact_object = {
+            'wikidata_id': wikidata_id,
+            'name': landmark['name'],
+            'text_sources': text_sources,
+            'url_sources': url_sources,
+            'formatted_prompt': formatted_facts,
+            'llm_summary': ''  # Will be filled in if summary generation succeeds
+        }
+    
+    if formatted_facts:
         summary = await call_openrouter_async(
             session,
-            wiki_content, 
+            formatted_facts, 
             api_key, 
             prompt_template,
             model=model,
@@ -464,11 +544,86 @@ async def generate_summary_for_item(
         )
         
         if summary:
-            item["llm_summary"] = summary
-            return item, True
+            landmark["llm_summary"] = summary
+            if fact_object:
+                fact_object['llm_summary'] = summary
+            return landmark, True, fact_object
     
-    return item, False
+    return landmark, False, fact_object
 
+async def generate_summary_for_city(
+    session: aiohttp.ClientSession,
+    city: Dict,
+    api_key: str,
+    prompt_template: str,
+    model: str,
+    semaphore: asyncio.Semaphore,
+    geonames_username: Optional[str] = None,
+    web_search_prompt: Optional[str] = None
+) -> Tuple[Dict, bool, Optional[Dict]]:
+    """Generate a summary for a city using multi-source fact gathering."""
+    
+    # For cities, we primarily use Wikipedia, as it has good coverage (797/798 cities in my testing. The missing city is "Q7473516" for those wondering lol)
+    gathered_facts = await gather_facts_for_landmark(
+        session,
+        city,
+        USER_AGENT,
+        geonames_username
+    )
+    
+    formatted_facts = format_facts_for_llm(gathered_facts, city, is_city=True)
+    
+    city['fact_sources'] = gathered_facts.get('sources', [])
+    city['fact_source_count'] = gathered_facts.get('source_count', 0)
+    
+    fact_object = None
+    wikidata_id = city.get('wikidata_id')
+    
+    if wikidata_id and gathered_facts.get('facts'):
+        text_sources = {}
+        url_sources = {}
+        
+        for fact in gathered_facts['facts']:
+            source_name = fact['source']
+            
+            if fact.get('content'):
+                text_sources[source_name] = fact['content']
+            
+            if fact.get('url'):
+                url_sources[source_name] = fact['url']
+            
+            if fact.get('infobox'):
+                text_sources[f'{source_name}_infobox'] = str(fact['infobox'])
+            if fact.get('tags'):
+                text_sources[f'{source_name}_tags'] = str(fact['tags'])
+        
+        fact_object = {
+            'wikidata_id': wikidata_id,
+            'name': city['name'],
+            'text_sources': text_sources,
+            'url_sources': url_sources,
+            'formatted_prompt': formatted_facts,
+            'llm_summary': ''
+        }
+    
+    if formatted_facts:
+        summary = await call_openrouter_async(
+            session,
+            formatted_facts, 
+            api_key, 
+            prompt_template,
+            model=model,
+            semaphore=semaphore,
+            web_search_prompt=web_search_prompt
+        )
+        
+        if summary:
+            city["llm_summary"] = summary
+            if fact_object:
+                fact_object['llm_summary'] = summary
+            return city, True, fact_object
+    
+    return city, False, fact_object
 
 async def generate_summaries_parallel(
     items: List[Dict],
@@ -477,71 +632,97 @@ async def generate_summaries_parallel(
     model: str,
     concurrency: int,
     item_type: str = "landmarks",
+    geonames_username: Optional[str] = None,
     web_search_prompt: Optional[str] = None
-) -> Tuple[List[Dict], int, int]:
-    """Generate LLM summaries for multiple items in parallel."""
+) -> Tuple[List[Dict], int, int, Dict[str, Dict]]:
+    """Generate LLM summaries for multiple items in parallel using multi-source facts."""
     
-    items_with_wiki = [item for item in items if item.get("wikipedia_url")]
-    items_without_wiki = [item for item in items if not item.get("wikipedia_url")]
+    items_with_data = [item for item in items if item.get("wikipedia_url") or item.get("wikivoyage_url")]
+    items_without_data = [item for item in items if not (item.get("wikipedia_url") or item.get("wikivoyage_url"))]
     
-    if not items_with_wiki:
-        print(f"  ⚠️  No {item_type} with Wikipedia URLs found")
-        return items, 0, 0
+    if not items_with_data:
+        print(f"  ⚠️  No {item_type} with Wikipedia/Wikivoyage URLs found")
+        return items, 0, 0, {}
     
-    print(f"  ℹ️  Processing {len(items_with_wiki)} {item_type} with Wikipedia URLs (skipping {len(items_without_wiki)} without URLs)")
+    print(f"  ℹ️  Processing {len(items_with_data)} {item_type} with source URLs (skipping {len(items_without_data)} without URLs)")
     
-    # Check if model has :online suffix
     if ":online" in model.lower():
         print(f"  🌐 Web search enabled (using :online model)")
+    
+    # Show active fact sources
+    active_sources = [name for name, config in FACT_SOURCES.items() if config['enabled']]
+    print(f"  📚 Active fact sources: {', '.join(active_sources)}")
     
     semaphore = asyncio.Semaphore(concurrency)
     
     success_count = 0
     failed_count = 0
+    facts_dict = {}  # Will store fact objects keyed by wikidata_id or city_id
     
     connector = aiohttp.TCPConnector(limit=concurrency * 2)
     timeout = aiohttp.ClientTimeout(total=60)
     
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = []
-        for item in items_with_wiki:
-            task = generate_summary_for_item(
-                session,
-                item,
-                api_key,
-                prompt_template,
-                model,
-                semaphore,
-                is_city=(item_type == "cities"),
-                web_search_prompt=web_search_prompt
-            )
-            tasks.append(task)
+        batch_size = 20
+        pbar = tqdm(total=len(items_with_data), desc=f"Generating {item_type} summaries", unit="item")
         
-        processed_with_wiki = []
-        try:
-            for coro in tqdm(
-                asyncio.as_completed(tasks),
-                total=len(tasks),
-                desc=f"Generating {item_type} summaries",
-                unit="item"
-            ):
-                try:
-                    item, success = await coro
-                    processed_with_wiki.append(item)
-                    if success:
-                        success_count += 1
-                    else:
-                        failed_count += 1
-                except Exception as e:
+        processed_items = []
+        
+        for i in range(0, len(items_with_data), batch_size):
+            batch = items_with_data[i:i + batch_size]
+            
+            batch_tasks = []
+            for item in batch:
+                if item_type == "landmarks":
+                    task = generate_summary_for_landmark(
+                        session,
+                        item,
+                        api_key,
+                        prompt_template,
+                        model,
+                        semaphore,
+                        geonames_username,
+                        web_search_prompt
+                    )
+                else:  # cities
+                    task = generate_summary_for_city(
+                        session,
+                        item,
+                        api_key,
+                        prompt_template,
+                        model,
+                        semaphore,
+                        geonames_username,
+                        web_search_prompt
+                    )
+                batch_tasks.append(task)
+            
+            results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            
+            for result in results:
+                if isinstance(result, Exception):
                     failed_count += 1
-        except asyncio.CancelledError:
-            print(f"\n⚠️  Processing cancelled. Completed {success_count} items.")
-            raise
+                    pbar.update(1)
+                    continue
+                
+                item, success, fact_object = result
+                processed_items.append(item)
+                if success:
+                    success_count += 1
+                else:
+                    failed_count += 1
+                
+                if fact_object and fact_object.get('wikidata_id'):
+                    facts_dict[fact_object['wikidata_id']] = fact_object
+                
+                pbar.update(1)
+            
+            if i + batch_size < len(items_with_data):
+                await asyncio.sleep(1)
     
-    all_results = processed_with_wiki + items_without_wiki
+    all_results = processed_items + items_without_data
     
-    return all_results, success_count, failed_count
-
+    return all_results, success_count, failed_count, facts_dict
 
 def generate_llm_summaries(
     landmarks: List[Dict], 
@@ -549,9 +730,10 @@ def generate_llm_summaries(
     prompt_template: str,
     model: str = DEFAULT_OPENROUTER_MODEL,
     concurrency: int = OPENROUTER_CONCURRENCY,
+    geonames_username: Optional[str] = None,
     web_search_prompt: Optional[str] = None 
-) -> List[Dict]:
-    """Generate LLM summaries for landmarks with Wikipedia URLs using parallel processing."""
+) -> Tuple[List[Dict], Dict[str, Dict]]:
+    """Generate LLM summaries for landmarks using multi-source fact gathering."""
     
     print(f"\n🤖 Generating LLM summaries for landmarks...")
     print(f"    Model: {model}")
@@ -560,13 +742,14 @@ def generate_llm_summaries(
     
     success_count = 0
     failed_count = 0
+    facts_dict = {}
     
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
         try:
-            processed_landmarks, success_count, failed_count = loop.run_until_complete(
+            processed_landmarks, success_count, failed_count, facts_dict = loop.run_until_complete(
                 generate_summaries_parallel(
                     landmarks,
                     api_key,
@@ -574,7 +757,8 @@ def generate_llm_summaries(
                     model,
                     concurrency,
                     "landmarks",
-                    web_search_prompt=web_search_prompt
+                    geonames_username,
+                    web_search_prompt
                 )
             )
         finally:
@@ -594,6 +778,17 @@ def generate_llm_summaries(
         print(f"\n✅ Landmark summary generation complete:")
         print(f"    • Successful: {success_count}")
         print(f"    • Failed: {failed_count}")
+        
+        # Show fact source statistics
+        source_stats = {}
+        for lm in landmarks:
+            for source in lm.get('fact_sources', []):
+                source_stats[source] = source_stats.get(source, 0) + 1
+        
+        if source_stats:
+            print(f"    • Fact sources used:")
+            for source, count in sorted(source_stats.items(), key=lambda x: x[1], reverse=True):
+                print(f"      - {source}: {count} landmarks")
     
     except KeyboardInterrupt:
         print(f"\n⚠️  Summary generation interrupted by user.")
@@ -601,8 +796,7 @@ def generate_llm_summaries(
     except Exception as e:
         print(f"\n❌ Error during summary generation: {e}")
     
-    return landmarks
-
+    return landmarks, facts_dict
 
 def generate_city_summaries(
     towns: List[Dict],
@@ -610,9 +804,10 @@ def generate_city_summaries(
     prompt_template: str,
     model: str = DEFAULT_OPENROUTER_MODEL,
     concurrency: int = OPENROUTER_CONCURRENCY,
+    geonames_username: Optional[str] = None,
     web_search_prompt: Optional[str] = None
-) -> List[Dict]:
-    """Generate LLM summaries for cities with Wikipedia URLs using parallel processing."""
+) -> Tuple[List[Dict], Dict[str, Dict]]:
+    """Generate LLM summaries for cities using multi-source fact gathering."""
     cities_dict = {}
     for town in towns:
         town_name = town["name"]
@@ -628,13 +823,14 @@ def generate_city_summaries(
     
     success_count = 0
     failed_count = 0
+    facts_dict = {}
     
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
         try:
-            processed_cities, success_count, failed_count = loop.run_until_complete(
+            processed_cities, success_count, failed_count, facts_dict = loop.run_until_complete(
                 generate_summaries_parallel(
                     unique_cities,
                     api_key,
@@ -642,7 +838,8 @@ def generate_city_summaries(
                     model,
                     concurrency,
                     "cities",
-                    web_search_prompt=web_search_prompt
+                    geonames_username,
+                    web_search_prompt
                 )
             )
         finally:
@@ -652,12 +849,18 @@ def generate_city_summaries(
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
         
-        summary_map = {city["name"]: city.get("llm_summary") for city in processed_cities if city.get("llm_summary")}
+        processed_map = {city["name"]: city for city in processed_cities}
         
-        for town in towns:
+        for i, town in enumerate(towns):
             town_name = town["name"]
-            if town_name in summary_map:
-                town["llm_summary"] = summary_map[town_name]
+            if town_name in processed_map:
+                processed_city = processed_map[town_name]
+                # Copy over the enriched fields
+                town["fact_sources"] = processed_city.get("fact_sources", [])
+                town["fact_source_count"] = processed_city.get("fact_source_count", 0)
+                if processed_city.get("llm_summary"):
+                    town["llm_summary"] = processed_city["llm_summary"]
+                towns[i] = town
         
         print(f"\n✅ City summary generation complete:")
         print(f"    • Successful: {success_count}")
@@ -669,7 +872,7 @@ def generate_city_summaries(
     except Exception as e:
         print(f"\n❌ Error during city summary generation: {e}")
     
-    return towns
+    return towns, facts_dict
 
 def parse_landmarks(results: Dict) -> List[Dict]:
     """Parse landmark data from SPARQL results."""
@@ -677,7 +880,7 @@ def parse_landmarks(results: Dict) -> List[Dict]:
     items = results["results"]["bindings"]
     skipped_coords = 0
     
-    print("\n📍 Parsing landmark data...")
+    print("\n📝 Parsing landmark data...")
     for item in tqdm(items, desc="Processing landmarks", unit="landmark"):
         try:
             coord_str = item["coordinate"]["value"]
@@ -690,7 +893,10 @@ def parse_landmarks(results: Dict) -> List[Dict]:
             lon, lat = coords
             
             name = item["itemLabel"]["value"]
-            clean_name = clean_landmark_name(name)
+            type_label = item["typeLabel"]["value"]
+            type_key = get_landmark_type_key(type_label)
+            
+            clean_name = clean_landmark_name(name, type_key)
             romanized_name = romanize_name(name)
             
             landmark = {
@@ -698,10 +904,12 @@ def parse_landmarks(results: Dict) -> List[Dict]:
                 "name": name,
                 "name_clean": clean_name,
                 "name_romanized": romanized_name,
-                "type": item["typeLabel"]["value"].lower(),
+                "type": type_label.lower(),
+                "type_key": type_key,
                 "latitude": float(lat),
                 "longitude": float(lon),
                 "wikipedia_url": item.get("wikipedia", {}).get("value", ""),
+                "wikivoyage_url": item.get("wikivoyage", {}).get("value", ""),
                 "image_url": item.get("image", {}).get("value", ""),
                 "osm_node_id": item.get("osmNode", {}).get("value", ""),
                 "prefecture": "",
@@ -709,7 +917,6 @@ def parse_landmarks(results: Dict) -> List[Dict]:
             }
             landmarks.append(landmark)
         except (ValueError, KeyError, IndexError) as e:
-            # Skip landmarks with invalid or missing coordinates
             skipped_coords += 1
             continue
     
@@ -739,6 +946,7 @@ def parse_towns(results: Dict) -> List[Dict]:
             lon, lat = coords
             
             town_name = item["townLabel"]["value"]
+            wikidata_id = item["town"]["value"].split("/")[-1]
             prefecture_raw = item.get("prefectureLabel", {}).get("value", "")
             prefecture = clean_prefecture_name(prefecture_raw)
             
@@ -754,7 +962,7 @@ def parse_towns(results: Dict) -> List[Dict]:
             if "population" in item:
                 pop_value = item["population"]["value"]
                 try:
-                    if not pop_value.startswith("http"):  # Skip URIs
+                    if not pop_value.startswith("http"):
                         population = int(float(pop_value))
                         if "pointInTime" in item:
                             point_in_time = item["pointInTime"]["value"]
@@ -764,23 +972,16 @@ def parse_towns(results: Dict) -> List[Dict]:
             
             if population is None:
                 skipped_null_pop += 1
-                continue  # Skip items with null population
+                continue
             
-            town_key = f"{town_name}_{prefecture}_{round(float(lat), 3)}_{round(float(lon), 3)}"
+            # Use wikidata_id for deduplication
+            town_key = wikidata_id
             
             if town_key in towns_dict:
                 existing = towns_dict[town_key]
-                # Prefer the entry with:
-                # 1. Capital status over non-capital
-                # 2. Wikipedia URL over no URL
-                # 3. Image URL over no image
-                # 4. More recent date (if both have dates)
-                # 5. Higher population (if no dates or same date)
-                # 6. Having a prefecture over not having one
                 
                 should_replace = False
                 
-                # Capital status takes precedence
                 if is_capital and not existing.get("is_capital"):
                     should_replace = True
                 elif wikipedia_url and not existing.get("wikipedia_url"):
@@ -801,6 +1002,7 @@ def parse_towns(results: Dict) -> List[Dict]:
                     continue
             
             town_data = {
+                "wikidata_id": wikidata_id,
                 "name": town_name,
                 "latitude": float(lat),
                 "longitude": float(lon),
@@ -840,82 +1042,13 @@ def parse_towns(results: Dict) -> List[Dict]:
     
     return towns
 
-def fetch_additional_images(landmarks: List[Dict], skip_additional: bool = False,
-                           cache: Optional[Dict] = None, cache_expiry_days: int = DEFAULT_CACHE_EXPIRY_DAYS,
-                           force_refresh: bool = False) -> List[Dict]:
-    """Fetch additional images for landmarks without images."""
-    landmarks_without_images = [lm for lm in landmarks if not lm.get("image_url")]
-    
-    if not landmarks_without_images or skip_additional:
-        if skip_additional and landmarks_without_images:
-            print(f"\n🖼️  Skipping additional image search for {len(landmarks_without_images)} landmarks (use --fetch-all-images to enable)")
-        return landmarks
-    
-    print(f"\n🖼️  Fetching additional images for {len(landmarks_without_images)} landmarks...")
-    print("    ⚠️  This may take a while due to rate limiting. Press Ctrl+C to skip this step.")
-    
-    batch_size = 20  # Process in batches to reduce queries
-    batches = [landmarks_without_images[i:i + batch_size] for i in range(0, len(landmarks_without_images), batch_size)]
-    
-    try:
-        for batch_idx, batch in enumerate(tqdm(batches, desc="Image batches", unit="batch")):
-            wikidata_ids = [lm["wikidata_id"] for lm in batch]
-            ids_str = " ".join([f"wd:{wid}" for wid in wikidata_ids])
-            
-            # Batch query for Commons categories
-            query = f"""
-            SELECT ?item ?category WHERE {{
-              VALUES ?item {{ {ids_str} }}
-              OPTIONAL {{ ?item wdt:P373 ?category. }}
-            }}
-            """
-            
-            try:
-                # Check cache first
-                use_cached = False
-                if cache is not None and not force_refresh:
-                    cache_key = get_cache_key(query)
-                    if cache_key in cache["data"]:
-                        cache_entry = cache["data"][cache_key]
-                        if is_cache_valid(cache_entry, cache_expiry_days):
-                            results = cache_entry["results"]
-                            use_cached = True
-                
-                if not use_cached:
-                    results = fetch_wikidata(query, delay=True, cache=cache, 
-                                            cache_expiry_days=cache_expiry_days,
-                                            force_refresh=force_refresh)
-                
-                for binding in results["results"]["bindings"]:
-                    item_id = binding["item"]["value"].split("/")[-1]
-                    if "category" in binding:
-                        for lm in batch:
-                            if lm["wikidata_id"] == item_id:
-                                lm["commons_category"] = binding["category"]["value"]
-                                break
-                
-                if not use_cached:
-                    time.sleep(REQUEST_DELAY * 2)
-                
-            except Exception as e:
-                print(f"\n⚠️  Failed to fetch images for batch {batch_idx + 1}: {e}")
-                continue
-                
-    except KeyboardInterrupt:
-        print("\n⚠️  Image fetching interrupted by user. Continuing with available data...")
-    
-    return landmarks
-
-from scipy.spatial import KDTree
-
 def assign_nearby_towns(landmarks: List[Dict], towns: List[Dict]) -> List[Dict]:
-    """Assign nearby towns and closest major city to each landmark"""
+    """Assign nearby towns and closest major city to each landmark."""
     print("\n🗺️  Calculating nearby towns for landmarks...")
     
     major_cities = [t for t in towns if t.get("is_capital") or (t.get("population") is not None and t.get("population") > MAJOR_CITY_POPULATION_THRESHOLD)]
     print(f"  ℹ️  Using {len(major_cities)} major cities for closest major city calculation")
     
-    # Build KDTrees
     town_coords = np.array([[t["latitude"], t["longitude"]] for t in towns])
     town_tree = KDTree(town_coords)
     
@@ -926,26 +1059,20 @@ def assign_nearby_towns(landmarks: List[Dict], towns: List[Dict]) -> List[Dict]:
     for lm in tqdm(landmarks, desc="Finding nearby towns", unit="landmark"):
         lm_coord = np.array([lm["latitude"], lm["longitude"]])
         
-        # Find closest town using KDTree
         closest_dist_deg, closest_idx = town_tree.query(lm_coord)
         closest_town = towns[closest_idx]
         
-        # Get kilometers from degrees
         closest_dist_km = geodesic(
             (lm["latitude"], lm["longitude"]),
             (closest_town["latitude"], closest_town["longitude"])
         ).km
         
-        # Set prefecture from closest town
         if closest_town["prefecture"]:
             lm["prefecture"] = closest_town["prefecture"]
         
-        # We consider every town within 4km of the closest to also be a nearby town
         radius_km = closest_dist_km + 4
-        # Approximate conversion based on Japan's latitude (thanks ChatGPT)
         radius_deg = radius_km / 85.0
         
-        # Query all towns within radius
         indices = town_tree.query_ball_point(lm_coord, radius_deg)
         
         nearby_towns_dict = {}
@@ -958,10 +1085,11 @@ def assign_nearby_towns(landmarks: List[Dict], towns: List[Dict]) -> List[Dict]:
             
             if dist_km <= radius_km:
                 town_name = town["name"]
+                town_id = town["wikidata_id"]
                 if town_name not in nearby_towns_dict or dist_km < nearby_towns_dict[town_name]["distance_km"]:
-                    # Include image_url if available
                     nearby_town_data = {
                         "name": town_name,
+                        "id": town_id,
                         "distance_km": round(dist_km, 2),
                         "prefecture": town["prefecture"],
                         "population": town.get("population")
@@ -974,11 +1102,9 @@ def assign_nearby_towns(landmarks: List[Dict], towns: List[Dict]) -> List[Dict]:
         nearby_towns = list(nearby_towns_dict.values())
         nearby_towns.sort(key=lambda x: x["distance_km"])
         
-        # Limit to 10 nearest unique towns
         lm["nearby_towns"] = nearby_towns[:10]
         lm["closest_town_distance_km"] = round(closest_dist_km, 2)
         
-        # Find closest major city
         if major_cities:
             _, major_idx = major_tree.query(lm_coord)
             closest_major = major_cities[major_idx]
@@ -989,6 +1115,7 @@ def assign_nearby_towns(landmarks: List[Dict], towns: List[Dict]) -> List[Dict]:
             
             closest_major_data = {
                 "name": closest_major["name"],
+                "id": closest_major["wikidata_id"],
                 "distance_km": round(closest_major_dist, 2),
                 "prefecture": closest_major["prefecture"],
                 "population": closest_major.get("population"),
@@ -1007,11 +1134,10 @@ def generate_statistics(landmarks: List[Dict], towns: List[Dict]) -> Dict:
     """Generate statistics about the collected data."""
     stats = {
         "total_landmarks": len(landmarks),
-        "mountains": sum(1 for lm in landmarks if "mountain" in lm["type"]),
-        "lakes": sum(1 for lm in landmarks if "lake" in lm["type"]),
-        "shrines": sum(1 for lm in landmarks if "shrine" in lm["type"].lower()),
         "with_wikipedia": sum(1 for lm in landmarks if lm.get("wikipedia_url")),
+        "with_wikivoyage": sum(1 for lm in landmarks if lm.get("wikivoyage_url")),
         "with_images": sum(1 for lm in landmarks if lm.get("image_url")),
+        "with_alternative_images": sum(1 for lm in landmarks if lm.get("alternative_images")),
         "with_osm_node": sum(1 for lm in landmarks if lm.get("osm_node_id")),
         "with_llm_summary": sum(1 for lm in landmarks if lm.get("llm_summary")),
         "prefectures": len(set(lm["prefecture"] for lm in landmarks if lm["prefecture"])),
@@ -1021,35 +1147,75 @@ def generate_statistics(landmarks: List[Dict], towns: List[Dict]) -> Dict:
         "cities_with_images": sum(1 for t in towns if t.get("image_url")),
         "cities_with_llm_summary": sum(1 for t in towns if t.get("llm_summary"))
     }
+    
+    type_counts = {}
+    for lm in landmarks:
+        type_key = lm.get("type_key", lm.get("type", "unknown"))
+        type_counts[type_key] = type_counts.get(type_key, 0) + 1
+    
+    stats["by_type"] = type_counts
+    
+    # Multi-source statistics
+    if any(lm.get("fact_sources") for lm in landmarks):
+        stats["fact_sources_used"] = {}
+        for lm in landmarks:
+            for source in lm.get("fact_sources", []):
+                stats["fact_sources_used"][source] = stats["fact_sources_used"].get(source, 0) + 1
+    
+    if any(lm.get("alternative_images") for lm in landmarks):
+        total_alt_images = sum(len(lm.get("alternative_images", [])) for lm in landmarks)
+        stats["total_alternative_images"] = total_alt_images
+        
+        image_sources = {}
+        for lm in landmarks:
+            for img in lm.get("alternative_images", []):
+                source = img.get("source", "unknown")
+                image_sources[source] = image_sources.get(source, 0) + 1
+        stats["image_sources_used"] = image_sources
+    
     return stats
 
 def main():
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Collect Japanese landmarks data from Wikidata")
-    parser.add_argument("--skip-images", action="store_true", 
-                       help="Skip the additional image fetching step")
-    parser.add_argument("--output", default="japan_landmarks.json",
-                       help="Output filename (default: japan_landmarks.json)")
+    parser = argparse.ArgumentParser(description="Collect Japanese landmarks data from Wikidata with multi-source enrichment")
+    parser.add_argument("--output", default="output/japan_landmarks.json",
+                       help="Output filename (default: output/japan_landmarks.json)")
     parser.add_argument("--email", type=str,
                        help="Your email for the User-Agent header (required by Wikimedia)")
+    
+    # Landmark type selection
+    parser.add_argument("--landmark-types", type=str, nargs='+',
+                       choices=list(LANDMARK_TYPES.keys()),
+                       help=f"Specific landmark types to fetch (default: all). Choices: {', '.join(LANDMARK_TYPES.keys())}")
     
     # LLM summarization arguments
     parser.add_argument("--generate-summaries", action="store_true",
                        help="Generate LLM summaries for landmarks using OpenRouter")
+    parser.add_argument("--generate-city-summaries", action="store_true",
+                    help="Generate LLM summaries for cities/towns (requires --generate-summaries)")
     parser.add_argument("--openrouter-api-key", type=str,
                        help="OpenRouter API key for LLM summarization")
     parser.add_argument("--llm-model", type=str, default=DEFAULT_OPENROUTER_MODEL,
                        help=f"OpenRouter model to use (default: {DEFAULT_OPENROUTER_MODEL})")
     parser.add_argument("--llm-prompt", type=str, default=DEFAULT_PROMPT_TEMPLATE,
-                       help="Prompt template for LLM (use {wikipedia_content} as placeholder)")
+                       help="Prompt template for LLM (use {formatted_facts} as placeholder)")
     parser.add_argument("--llm-concurrency", type=int, default=OPENROUTER_CONCURRENCY,
                        help=f"Number of parallel LLM requests (default: {OPENROUTER_CONCURRENCY})")
-    parser.add_argument("--generate-city-summaries", action="store_true",
-                       help="Generate LLM summaries for cities/towns (requires --generate-summaries)")
     parser.add_argument("--enable-web-search", action="store_true",
                        help="Enable OpenRouter web search plugin for additional research")
     parser.add_argument("--web-search-prompt", type=str, default=DEFAULT_WEB_SEARCH_PROMPT,
-                       help="Custom prompt for web search results (overrides OpenRouter default)")
+                       help="Custom prompt for web search results")
+    
+    # Multi-source API keys
+    parser.add_argument("--geonames-username", type=str,
+                       help="GeoNames username for fact gathering")
+    parser.add_argument("--flickr-api-key", type=str,
+                       help="Flickr API key for image gathering")
+    parser.add_argument("--unsplash-api-key", type=str,
+                       help="Unsplash API key for image gathering")
+    
+    # Image gathering control
+    parser.add_argument("--gather-images", action="store_true",
+                       help="Enable multi-source image gathering (Wikimedia Commons, Flickr, Unsplash)")
     
     # Cache arguments
     parser.add_argument("--cache-file", type=str, default=DEFAULT_CACHE_FILE,
@@ -1063,6 +1229,13 @@ def main():
     
     args = parser.parse_args()
     
+    # Scaffold directories
+    cache_path = Path(args.cache_file)
+    output_path = Path(args.output)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     # Validate LLM arguments
     if args.generate_summaries and not args.openrouter_api_key:
         print("\n❌ Error: --openrouter-api-key is required when --generate-summaries is enabled")
@@ -1076,19 +1249,39 @@ def main():
     # Update User-Agent if email is provided
     global USER_AGENT, HEADERS
     if args.email:
-        USER_AGENT = f"JapanLandmarksCollector/1.0 (https://github.com/yourusername/japan-landmarks; {args.email}) python-requests/2.31"
+        USER_AGENT = f"JapanLandmarksCollector/1.0 (https://github.com/Cruxial0/japan-landmarks; {args.email}) python-requests/2.31"
         HEADERS["User-Agent"] = USER_AGENT
+    
+    # Determine which landmark types to fetch
+    selected_types = LANDMARK_TYPES
+    if args.landmark_types:
+        selected_types = {k: v for k, v in LANDMARK_TYPES.items() if k in args.landmark_types}
+        print(f"\n🔍 Fetching only selected types: {', '.join([v['display_name'] for v in selected_types.values()])}")
     
     print("=" * 60)
     print("🗾 Japanese Landmarks Data Collector")
     print("=" * 60)
+    print(f"\n📋 Available landmark types:")
+    for key, config in LANDMARK_TYPES.items():
+        indicator = "✓" if key in selected_types else " "
+        print(f"  [{indicator}] {config['display_name']} (Wikidata: {config['wikidata_id']})")
+    
+    # Show enabled features
+    print(f"\n🔧 Enabled features:")
+    print(f"  • Multi-source fact gathering: {'✓' if args.generate_summaries else '✗'}")
+    if args.generate_summaries:
+        active_sources = [name for name, config in FACT_SOURCES.items() if config['enabled']]
+        print(f"    Sources: {', '.join(active_sources)}")
+    print(f"  • Multi-source image gathering: {'✓' if args.gather_images else '✗'}")
+    if args.gather_images:
+        active_sources = [name for name, config in IMAGE_SOURCES.items() if config['enabled']]
+        print(f"    Sources: {', '.join(active_sources)}")
     
     # Check if User-Agent is properly configured
     if "your.email@example.com" in USER_AGENT:
         print("\n⚠️  WARNING: Please provide your email for the User-Agent header!")
         print("    This is required by Wikimedia's User-Agent Policy.")
         print("    Use: python main.py --email your.email@example.com")
-        print("    Or edit the USER_AGENT variable in the script.")
         response = input("\nContinue anyway? (y/n): ")
         if response.lower() != 'y':
             print("Exiting. Please provide email and try again.")
@@ -1116,16 +1309,19 @@ def main():
             print(f"\n⚠️  Caching disabled - all data will be fetched fresh")
         
         # Determine number of steps
-        total_steps = 5
+        total_steps = 4
+        if args.gather_images:
+            total_steps += 1
         if args.generate_summaries:
             total_steps += 1
         if args.generate_city_summaries:
             total_steps += 1
         
-        # Fetch landmarks
+        # Build and fetch landmarks query
         print(f"\n📊 Step 1/{total_steps}: Fetching landmarks from Wikidata...")
+        landmark_query = build_landmark_query(selected_types)
         landmark_results = fetch_wikidata(
-            LANDMARK_QUERY, 
+            landmark_query, 
             "Fetching landmarks", 
             delay=False,
             cache=cache,
@@ -1153,51 +1349,65 @@ def main():
         landmarks = assign_nearby_towns(landmarks, towns)
         print("✅ Nearby towns calculated")
         
-        # Try to fetch additional images (optional)
-        print(f"\n📊 Step 4/{total_steps}: Fetching additional images...")
-        landmarks = fetch_additional_images(
-            landmarks, 
-            skip_additional=args.skip_images,
-            cache=cache,
-            cache_expiry_days=args.cache_expiry_days if not args.no_cache else 0,
-            force_refresh=args.force_refresh
-        )
-        print("✅ Image search completed")
-        
         # Save cache after Wikidata queries
         if cache is not None:
             print(f"\n💾 Saving cache to {args.cache_file}...")
             save_cache(cache, args.cache_file)
             print(f"  ✓ Cache saved: {len(cache.get('data', {}))} entries")
         
-        # Generate LLM summaries (optional)
-        current_step = 5
-        if args.generate_summaries:
-            print(f"\n📊 Step {current_step}/{total_steps}: Generating landmark LLM summaries...")
+        current_step = 4
+        
+        # Multi-source image gathering (optional)
+        if args.gather_images:
+            print(f"\n📊 Step {current_step}/{total_steps}: Gathering images from multiple sources...")
             
-            # Use web_search_prompt only if model has :online suffix
+            # Run async image gathering
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                landmarks = loop.run_until_complete(
+                    enrich_landmarks_with_images(
+                        landmarks,
+                        flickr_api_key=args.flickr_api_key,
+                        unsplash_api_key=args.unsplash_api_key
+                    )
+                )
+            finally:
+                loop.close()
+            
+            print("✅ Multi-source image gathering completed")
+            current_step += 1
+        
+        # Generate LLM summaries with multi-source facts (optional)
+        landmark_facts = {}
+        if args.generate_summaries:
+            print(f"\n📊 Step {current_step}/{total_steps}: Generating landmark LLM summaries with multi-source facts...")
+            
             search_prompt = args.web_search_prompt if ":online" in args.llm_model.lower() else None
             
-            landmarks = generate_llm_summaries(
+            landmarks, landmark_facts = generate_llm_summaries(
                 landmarks,
                 api_key=args.openrouter_api_key,
                 prompt_template=args.llm_prompt,
                 model=args.llm_model,
                 concurrency=args.llm_concurrency,
+                geonames_username=args.geonames_username,
                 web_search_prompt=search_prompt
             )
             print("✅ Landmark LLM summary generation completed")
             current_step += 1
         
         # Generate city summaries (optional)
+        city_facts = {}
         if args.generate_city_summaries:
             print(f"\n📊 Step {current_step}/{total_steps}: Generating city LLM summaries...")
-            towns = generate_city_summaries(
+            towns, city_facts = generate_city_summaries(
                 towns,
                 api_key=args.openrouter_api_key,
                 prompt_template=args.llm_prompt,
                 model=args.llm_model,
                 concurrency=args.llm_concurrency,
+                geonames_username=args.geonames_username,
                 web_search_prompt=search_prompt
             )
             print("✅ City LLM summary generation completed")
@@ -1208,9 +1418,15 @@ def main():
         stats = generate_statistics(landmarks, towns)
         
         # Save to JSON
+        # Combine landmark and city facts
+        all_facts = {}
+        all_facts.update(landmark_facts)
+        all_facts.update(city_facts)
+        
         output_data = {
             "metadata": {
                 "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "landmark_types": {k: v['display_name'] for k, v in selected_types.items()},
                 "statistics": stats,
                 "user_agent": USER_AGENT,
                 "cache_info": {
@@ -1223,11 +1439,17 @@ def main():
                     "enabled": args.generate_summaries,
                     "model": args.llm_model if args.generate_summaries else None,
                     "concurrency": args.llm_concurrency if args.generate_summaries else None,
-                    "city_summaries_enabled": args.generate_city_summaries
-                } if args.generate_summaries else None
+                    "city_summaries_enabled": args.generate_city_summaries,
+                    "fact_sources": list(FACT_SOURCES.keys()) if args.generate_summaries else None
+                } if args.generate_summaries else None,
+                "image_gathering": {
+                    "enabled": args.gather_images,
+                    "sources": list(IMAGE_SOURCES.keys()) if args.gather_images else None
+                } if args.gather_images else None
             },
             "landmarks": landmarks,
-            "cities": towns
+            "cities": towns,
+            "facts": all_facts
         }
         
         with open(args.output, "w", encoding="utf-8") as f:
@@ -1236,14 +1458,30 @@ def main():
         print("\n" + "=" * 60)
         print("📈 Collection Statistics:")
         print(f"  • Total landmarks: {stats['total_landmarks']}")
-        print(f"  • Mountains: {stats['mountains']}")
-        print(f"  • Lakes: {stats['lakes']}")
-        print(f"  • Shinto Shrines: {stats['shrines']}")
-        print(f"  • With Wikipedia articles: {stats['with_wikipedia']}")
+        
+        if stats.get('by_type'):
+            print(f"\n  Landmarks by type:")
+            for type_key, count in sorted(stats['by_type'].items(), key=lambda x: x[1], reverse=True):
+                display_name = LANDMARK_TYPES.get(type_key, {}).get('display_name', type_key.title())
+                print(f"    - {display_name}: {count}")
+        
+        print(f"\n  • With Wikipedia articles: {stats['with_wikipedia']}")
+        print(f"  • With Wikivoyage articles: {stats['with_wikivoyage']}")
         print(f"  • With images: {stats['with_images']}")
+        if stats.get('with_alternative_images'):
+            print(f"  • With alternative images: {stats['with_alternative_images']}")
+            print(f"  • Total alternative images: {stats.get('total_alternative_images', 0)}")
+        if stats.get('image_sources_used'):
+            print(f"\n  Image sources used:")
+            for source, count in sorted(stats['image_sources_used'].items(), key=lambda x: x[1], reverse=True):
+                print(f"    - {source}: {count} images")
         print(f"  • With OSM node IDs: {stats['with_osm_node']}")
         if args.generate_summaries:
             print(f"  • With LLM summaries: {stats['with_llm_summary']}")
+            if stats.get('fact_sources_used'):
+                print(f"\n  Fact sources used:")
+                for source, count in sorted(stats['fact_sources_used'].items(), key=lambda x: x[1], reverse=True):
+                    print(f"    - {source}: {count} landmarks")
         print(f"  • With major city info: {stats['with_major_city']}")
         print(f"  • Prefectures covered: {stats['prefectures']}")
         print(f"\n  • Total cities/towns: {stats['total_cities']}")
@@ -1254,14 +1492,44 @@ def main():
         print("=" * 60)
         print(f"\n✅ Data saved to: {args.output}")
         
-        if args.skip_images and stats['with_images'] < stats['total_landmarks']:
-            print(f"\n💡 Tip: Run without --skip-images to fetch images for remaining {stats['total_landmarks'] - stats['with_images']} landmarks")
+        # Facts section info
+        if all_facts:
+            print(f"\n📚 Facts section:")
+            print(f"  • Total fact entries: {len(all_facts)}")
+            print(f"  • Landmark facts: {len(landmark_facts)}")
+            print(f"  • City facts: {len(city_facts)}")
+            
+            # Count sources in facts
+            text_source_counts = {}
+            url_source_counts = {}
+            for fact_key, fact_data in all_facts.items():
+                for source in fact_data.get('text_sources', {}).keys():
+                    # Remove _infobox and _tags suffixes for counting
+                    base_source = source.replace('_infobox', '').replace('_tags', '')
+                    text_source_counts[base_source] = text_source_counts.get(base_source, 0) + 1
+                for source in fact_data.get('url_sources', {}).keys():
+                    url_source_counts[source] = url_source_counts.get(source, 0) + 1
+            
+            if text_source_counts:
+                print(f"  • Text sources distribution:")
+                for source, count in sorted(text_source_counts.items(), key=lambda x: x[1], reverse=True):
+                    print(f"    - {source}: {count} entries")
+        
+        # Helpful tips
+        if not args.gather_images:
+            print(f"\n💡 Tip: Use --gather-images to fetch images from Wikimedia Commons, Flickr, and Unsplash")
         
         if not args.generate_summaries and stats['with_wikipedia'] > 0:
-            print(f"\n💡 Tip: Use --generate-summaries to create AI-generated descriptions for {stats['with_wikipedia']} landmarks with Wikipedia articles")
+            print(f"\n💡 Tip: Use --generate-summaries to create AI-generated descriptions using multi-source facts")
         
-        if args.generate_summaries and not args.generate_city_summaries and stats['cities_with_wikipedia'] > 0:
-            print(f"\n💡 Tip: Use --generate-city-summaries to create AI-generated descriptions for {stats['cities_with_wikipedia']} cities with Wikipedia articles")
+        if args.generate_summaries and not args.geonames_username:
+            print(f"\n💡 Tip: Use --geonames-username to enable GeoNames fact gathering (register at http://www.geonames.org/)")
+        
+        if args.gather_images and not args.flickr_api_key:
+            print(f"\n💡 Tip: Use --flickr-api-key to enable Flickr image gathering")
+        
+        if args.gather_images and not args.unsplash_api_key:
+            print(f"\n💡 Tip: Use --unsplash-api-key to enable Unsplash image gathering")
         
     except Exception as e:
         print(f"\n❌ Error: {e}")
