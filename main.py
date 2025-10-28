@@ -73,11 +73,14 @@ DEFAULT_CACHE_FILE = "cache/wikidata_cache.json"
 CACHE_VERSION = "1.0"
 DEFAULT_CACHE_EXPIRY_DAYS = 7
 
+# Batching configuration
+BATCH_SIZE = 5
+
 # Landmark configuration
 # Objects added here will automatically be queried and processed as a landmark (assuming they have valid coordinates)
 LANDMARK_TYPES = {
     'mountain': {
-        'wikidata_id': 'Q8502',
+        'wikidata_id': 'Q8502 Q8072 Q193457 Q842928 Q6022321 Q674775 Q1142381 Q332614 Q1197120 Q1200524 Q1242936 Q1325302 Q1330974 Q1368970 Q169358 Q11275390 Q11277298 Q1595289 Q11505921 Q190869 Q212057 Q2143039 Q3116906 Q478788 Q27963400',
         'display_name': 'Mountain',
         'name_patterns': {
             'prefixes': [r'^Mount\s+', r'^Mt\.?\s+'],
@@ -88,7 +91,7 @@ LANDMARK_TYPES = {
         }
     },
     'lake': {
-        'wikidata_id': 'Q23397',
+        'wikidata_id': 'Q23397 Q3511952 Q204324 Q100900880 Q11253318 Q3215290 Q188025 Q1048337 Q3215752 Q1165822 Q458063 Q10313934 Q1140477 Q10671833 Q11349558 Q11726978 Q11726974 Q11727001 Q1898470 Q13598778 Q444677 Q18378697 Q4904826 Q27966643 Q58236221 Q66716634 Q131681 Q187223 Q131581612 Q132656659 Q11726988 Q358976 Q1521583 Q6341928 Q317995 Q3488975 Q3738260 Q7205721 Q121782022 Q122292419',
         'display_name': 'Lake',
         'name_patterns': {
             'prefixes': [r'^Lake\s+'],
@@ -96,7 +99,7 @@ LANDMARK_TYPES = {
         }
     },
     'shrine': {
-        'wikidata_id': 'Q845945',
+        'wikidata_id': 'Q697295 Q845945',
         'display_name': 'Shinto Shrine',
         'name_patterns': {
             'prefixes': [],
@@ -104,7 +107,7 @@ LANDMARK_TYPES = {
         }
     },
     'cave': {
-        'wikidata_id': 'Q35509',
+        'wikidata_id': 'Q35509 Q89497 Q1131329 Q98446107 Q2455463 Q1149405 Q3571304 Q1266984 Q1526552 Q11665546 Q3480180 Q7558985 Q135741893 Q57732276 Q58214675 Q58215210 Q58215273 Q107480506',
         'display_name': 'Cave',
         'name_patterns': {
             'prefixes': [],
@@ -112,7 +115,7 @@ LANDMARK_TYPES = {
         }
     },
     'bridge': {
-        'wikidata_id': 'Q12280',
+        'wikidata_id': 'Q12280 Q158555 Q12045874 Q428759 Q445800 Q3397526 Q158626 Q1494578 Q11552394 Q2104072 Q2297251 Q3396425 Q15980599 Q7577756 Q7661648 Q7850935 Q7883867 Q976622 Q12570 Q132775038 Q132775036 Q132775089 Q132795106 Q10513727 Q21494734 Q23701378 Q25105692 Q25556320 Q28976245 Q105501780 Q65045238 Q107040113 Q113866885 Q116188668 Q135995331 Q134303786 Q11111030 Q1143769 Q1415899 Q1250323 Q158448 Q99523097 Q11423692 Q11840152 Q17265036 Q474728 Q17105481 Q4868488 Q43514341 Q818882 Q25325210 Q50683289 Q1030403 Q1425971 Q157942 Q21170235 Q11396304 Q1704122 Q135994842 Q2933208 Q23383 Q64563393 Q108263503',
         'display_name': 'Bridge',
         'name_patterns': {
             'prefixes': [],
@@ -120,7 +123,7 @@ LANDMARK_TYPES = {
         }
     },
     'park': {
-        'wikidata_id': 'Q22698',
+        'wikidata_id': 'Q22698 Q6629955 Q7138600 Q6063204 Q11649671 Q12327290 Q16363669 Q1470855 Q3363945 Q11409728 Q11546861 Q11559043 Q21164403 Q11637995 Q11665557 Q1939700 Q2244647 Q3364370 Q15982170 Q820084 Q7339681 Q136486169 Q136486243 Q8564897 Q30326995 Q46169 Q22746 Q110451841 Q96120838 Q11298806 Q1886911 Q1711697 Q1995305 Q3243966 Q3363934 Q642682 Q21550840 Q1443808 Q11665453 Q15060435 Q79979740 Q107691783 Q116823462 Q116823535 Q116823488 Q116823586 Q118256174 Q491675',
         'display_name': 'Park',
         'name_patterns': {
             'prefixes': [],
@@ -129,22 +132,18 @@ LANDMARK_TYPES = {
     }
 }
 
+TYPE_MAPPINGS = {
+    'mountain': 'mountain',
+    'volcano': 'mountain'
+}
+
 GENERIC_NAME_PATTERNS = {
     'prefixes': [r'^御', r'^小', r'^大', r'^新', r'^北', r'^南', r'^東', r'^西'],
     'suffixes': []
 }
 
-def build_landmark_query(landmark_types: Dict = None) -> str:
-    """Dynamically build SPARQL query based on configured landmark types."""
-    if landmark_types is None:
-        landmark_types = LANDMARK_TYPES
-    
-    wikidata_ids = [f"wd:{config['wikidata_id']}" for config in landmark_types.values()]
-    values_clause = " ".join(wikidata_ids)
-    
-    type_names = [config['display_name'] for config in landmark_types.values()]
-    comment = ", ".join(type_names)
-    
+def build_landmark_query(values_clause: str, comment: str) -> str:
+    """Dynamically build SPARQL query based on provided values clause and comment."""
     query = f"""
 SELECT ?item ?itemLabel ?coordinate ?typeLabel ?wikipedia ?wikivoyage ?image ?osmNode ?wikidata WHERE {{
   VALUES ?type {{ {values_clause} }}  # {comment}
@@ -176,6 +175,7 @@ SELECT ?item ?itemLabel ?coordinate ?typeLabel ?wikipedia ?wikivoyage ?image ?os
   SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en,ja". }}
 }}
 """
+    print(query)
     return query
 
 TOWN_QUERY = """
@@ -227,7 +227,8 @@ def load_cache(cache_file: str) -> Dict:
         return {
             "version": CACHE_VERSION,
             "created_at": datetime.now().isoformat(),
-            "data": {}
+            "data": {},
+            "image_cache": {}  # Dedicated cache for external image URLs
         }
     
     try:
@@ -239,8 +240,13 @@ def load_cache(cache_file: str) -> Dict:
             return {
                 "version": CACHE_VERSION,
                 "created_at": datetime.now().isoformat(),
-                "data": {}
+                "data": {},
+                "image_cache": {}
             }
+        
+        # Ensure image_cache exists for older cache files
+        if "image_cache" not in cache:
+            cache["image_cache"] = {}
         
         return cache
     except Exception as e:
@@ -248,7 +254,8 @@ def load_cache(cache_file: str) -> Dict:
         return {
             "version": CACHE_VERSION,
             "created_at": datetime.now().isoformat(),
-            "data": {}
+            "data": {},
+            "image_cache": {}
         }
 
 def save_cache(cache: Dict, cache_file: str):
@@ -259,6 +266,52 @@ def save_cache(cache: Dict, cache_file: str):
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"  ⚠️  Failed to save cache: {e}")
+
+def load_image_cache_for_landmarks(landmarks: List[Dict], cache: Dict, cache_expiry_days: int) -> int:
+    """Load cached image URLs for landmarks. Returns count of cached images loaded."""
+    if not cache or "image_cache" not in cache:
+        return 0
+    
+    loaded_count = 0
+    image_cache = cache["image_cache"]
+    
+    for landmark in landmarks:
+        wikidata_id = landmark.get("wikidata_id")
+        if not wikidata_id or wikidata_id not in image_cache:
+            continue
+        
+        cache_entry = image_cache[wikidata_id]
+        if not is_cache_valid(cache_entry, cache_expiry_days):
+            continue
+        
+        # Load cached alternative images
+        if "alternative_images" in cache_entry and cache_entry["alternative_images"]:
+            landmark["alternative_images"] = cache_entry["alternative_images"]
+            loaded_count += 1
+    
+    return loaded_count
+
+def save_image_cache_for_landmarks(landmarks: List[Dict], cache: Dict):
+    """Save image URLs from landmarks to cache."""
+    if not cache:
+        return
+    
+    if "image_cache" not in cache:
+        cache["image_cache"] = {}
+    
+    image_cache = cache["image_cache"]
+    
+    for landmark in landmarks:
+        wikidata_id = landmark.get("wikidata_id")
+        if not wikidata_id:
+            continue
+        
+        # Only cache if there are alternative images
+        if landmark.get("alternative_images"):
+            image_cache[wikidata_id] = {
+                "cached_at": datetime.now().isoformat(),
+                "alternative_images": landmark["alternative_images"]
+            }
 
 def is_cache_valid(cache_entry: Dict, expiry_days: int) -> bool:
     """Check if a cache entry is still valid."""
@@ -330,6 +383,9 @@ def clean_landmark_name(name: str, landmark_type: str = None) -> str:
 def get_landmark_type_key(type_label: str) -> str:
     """Get the landmark type key from a Wikidata type label."""
     type_label_lower = type_label.lower()
+    
+    if type_label_lower in TYPE_MAPPINGS:
+        return TYPE_MAPPINGS[type_label_lower]
     
     for key, config in LANDMARK_TYPES.items():
         if config['display_name'].lower() == type_label_lower:
@@ -421,7 +477,7 @@ async def call_openrouter_async(
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/yourusername/japan-landmarks",
+                "HTTP-Referer": "https://github.com/Cruxial0/japan-landmarks",
                 "X-Title": "Japan Landmarks Collector"
             }
             
@@ -893,8 +949,15 @@ def parse_landmarks(results: Dict) -> List[Dict]:
             lon, lat = coords
             
             name = item["itemLabel"]["value"]
-            type_label = item["typeLabel"]["value"]
-            type_key = get_landmark_type_key(type_label)
+            type_label = item["typeLabel"]["value"]  # Specific WikiData type (e.g., "rock shelter")
+            type_key = get_landmark_type_key(type_label)  # Broader category key (e.g., "cave")
+            
+            # Get the broader category display name from LANDMARK_TYPES
+            if type_key in LANDMARK_TYPES:
+                broader_type = LANDMARK_TYPES[type_key]['display_name'].lower()
+            else:
+                # Fallback to type_key if not in LANDMARK_TYPES
+                broader_type = type_key.replace('_', ' ')
             
             clean_name = clean_landmark_name(name, type_key)
             romanized_name = romanize_name(name)
@@ -904,8 +967,9 @@ def parse_landmarks(results: Dict) -> List[Dict]:
                 "name": name,
                 "name_clean": clean_name,
                 "name_romanized": romanized_name,
-                "type": type_label.lower(),
-                "type_key": type_key,
+                "type": broader_type,  # Broader category (e.g., "cave")
+                "type_key": type_key,  # Category key (e.g., "cave")
+                "specific_subtype": type_label,  # Detailed WikiData type (e.g., "rock shelter")
                 "latitude": float(lat),
                 "longitude": float(lon),
                 "wikipedia_url": item.get("wikipedia", {}).get("value", ""),
@@ -1249,7 +1313,7 @@ def main():
     # Update User-Agent if email is provided
     global USER_AGENT, HEADERS
     if args.email:
-        USER_AGENT = f"JapanLandmarksCollector/1.0 (https://github.com/Cruxial0/japan-landmarks; {args.email}) python-requests/2.31"
+        USER_AGENT = f"JapanLandmarksCollector/1.0 (https://github.com/Cruxial0/JapanLandmarksCollector; {args.email}) python-requests/2.31"
         HEADERS["User-Agent"] = USER_AGENT
     
     # Determine which landmark types to fetch
@@ -1317,18 +1381,46 @@ def main():
         if args.generate_city_summaries:
             total_steps += 1
         
-        # Build and fetch landmarks query
+        # Build and fetch landmarks query in batches
         print(f"\n📊 Step 1/{total_steps}: Fetching landmarks from Wikidata...")
-        landmark_query = build_landmark_query(selected_types)
-        landmark_results = fetch_wikidata(
-            landmark_query, 
-            "Fetching landmarks", 
-            delay=False,
-            cache=cache,
-            cache_expiry_days=args.cache_expiry_days if not args.no_cache else 0,
-            force_refresh=args.force_refresh
-        )
-        landmarks = parse_landmarks(landmark_results)
+        
+        all_type_ids = []
+        for config in selected_types.values():
+            parts = config['wikidata_id'].split()
+            for part in parts:
+                if part.startswith('wd:'):
+                    all_type_ids.append(part)
+                else:
+                    all_type_ids.append(f'wd:{part}')
+        
+        batches = [all_type_ids[i:i + BATCH_SIZE] for i in range(0, len(all_type_ids), BATCH_SIZE)]
+        
+        landmark_results_list = []
+        for batch_idx, batch in enumerate(batches, 1):
+            print(f"Fetching landmarks batch {batch_idx}/{len(batches)}")
+            values_clause = " ".join(batch)
+            comment = "Batched landmark types"
+            landmark_query = build_landmark_query(values_clause, comment)
+            landmark_results = fetch_wikidata(
+                landmark_query, 
+                f"Fetching landmarks batch {batch_idx}", 
+                delay=bool(batch_idx > 1),
+                cache=cache,
+                cache_expiry_days=args.cache_expiry_days if not args.no_cache else 0,
+                force_refresh=args.force_refresh
+            )
+            landmark_results_list.append(landmark_results)
+        
+        combined_bindings = []
+        for res in landmark_results_list:
+            combined_bindings.extend(res['results']['bindings'])
+        
+        combined_results = {
+            "head": landmark_results_list[0]['head'] if landmark_results_list else {},
+            "results": {"bindings": combined_bindings}
+        }
+        
+        landmarks = parse_landmarks(combined_results)
         print(f"✅ Fetched {len(landmarks)} landmarks")
         
         # Fetch towns
@@ -1361,6 +1453,12 @@ def main():
         if args.gather_images:
             print(f"\n📊 Step {current_step}/{total_steps}: Gathering images from multiple sources...")
             
+            # Load cached images first
+            if cache is not None and not args.force_refresh:
+                cached_count = load_image_cache_for_landmarks(landmarks, cache, args.cache_expiry_days if not args.no_cache else 0)
+                if cached_count > 0:
+                    print(f"  ✓ Loaded cached images for {cached_count} landmarks")
+            
             # Run async image gathering
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -1374,6 +1472,11 @@ def main():
                 )
             finally:
                 loop.close()
+            
+            # Save newly fetched images to cache
+            if cache is not None:
+                save_image_cache_for_landmarks(landmarks, cache)
+                print(f"  ✓ Saved image cache")
             
             print("✅ Multi-source image gathering completed")
             current_step += 1
@@ -1433,6 +1536,7 @@ def main():
                     "enabled": not args.no_cache,
                     "cache_file": args.cache_file if not args.no_cache else None,
                     "cache_entries": len(cache.get("data", {})) if cache else 0,
+                    "image_cache_entries": len(cache.get("image_cache", {})) if cache else 0,
                     "cache_expiry_days": args.cache_expiry_days if not args.no_cache else None
                 } if not args.no_cache else {"enabled": False},
                 "llm_config": {
@@ -1454,6 +1558,13 @@ def main():
         
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(output_data, f, ensure_ascii=False, indent=2)
+        
+        # Save final cache (including images)
+        if cache is not None:
+            save_cache(cache, args.cache_file)
+            print(f"\n💾 Final cache saved:")
+            print(f"  • Query cache entries: {len(cache.get('data', {}))}")
+            print(f"  • Image cache entries: {len(cache.get('image_cache', {}))}")
         
         print("\n" + "=" * 60)
         print("📈 Collection Statistics:")

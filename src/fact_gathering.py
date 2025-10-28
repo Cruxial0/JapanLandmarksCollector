@@ -438,86 +438,75 @@ async def gather_facts_for_city(
 def format_facts_for_llm(gathered_facts: Dict, item: Dict, is_city: bool = False) -> str:
     """
     Format gathered facts into a structured prompt for LLM summarization.
+    Uses the format: Web sources (### SOURCE_NAME \n INFO) and Custom facts (NULL/N/A).
     """
     
-    sections = []
-    
     name = item['name']
+    location_type = "City" if is_city else item.get('specific_subtype', item.get('type', 'Unknown').title())
     prefecture = item.get('prefecture', 'Unknown Prefecture')
-    lat = item['latitude']
-    lon = item['longitude']
-    
-    if is_city:
-        header = f"""=== {name} ===
-Type: City
-Location: {prefecture}, Japan
-Coordinates: {lat:.4f}°N, {lon:.4f}°E
-Population: {item.get('population', 'Unknown')}"""
-        if item.get('is_capital'):
-            header += "\nCapital: Yes"
-    else:
-        header = f"""=== {name} ===
-Type: {item.get('type', 'Unknown').title()}
-Location: {prefecture}, Japan
-Coordinates: {lat:.4f}°N, {lon:.4f}°E"""
-    
-        if item.get('elevation'):
-            header += f"\nElevation: {item['elevation']}m"
-    
-    sections.append(header)
     
     facts = gathered_facts.get('facts', [])
     
-    if not facts:
-        sections.append("\n[LIMITED INFORMATION AVAILABLE]")
-        sections.append("Please create a brief, general summary based on the location type and name.")
-        return '\n\n'.join(sections)
+    # Build web sources section
+    web_sources = []
     
-    sections.append("\n" + "="*50)
-    sections.append("VERIFIED INFORMATION FROM MULTIPLE SOURCES")
-    sections.append("="*50)
+    if facts:
+        for fact in facts:
+            source_name = fact['source'].upper()
+            content = fact['content']
+            
+            # Add infobox data for Wikipedia if available
+            if fact['source'] == 'wikipedia' and fact.get('infobox'):
+                infobox_text = "\n".join([f"{k}: {v}" for k, v in list(fact['infobox'].items())[:5]])
+                if infobox_text:
+                    content = f"[Key Facts]\n{infobox_text}\n\n{content}"
+            
+            # Truncate content if too long
+            if len(content) > 2500:
+                content = content[:2500] + "..."
+            
+            web_sources.append(f"### {source_name}\n{content}")
     
-    for fact in facts:
-        source_label = fact['source'].upper()
-        content = fact['content']
-        
-        if fact['source'] == 'wikipedia' and fact.get('infobox'):
-            infobox_text = "\n".join([f"{k}: {v}" for k, v in list(fact['infobox'].items())[:5]])
-            if infobox_text:
-                content = f"[Key Facts]\n{infobox_text}\n\n{content}"
-        
-        # The Wikipedia Info box is usually not very verbose, but we truncate it regardless
-        if len(content) > 2500:
-            content = content[:2500] + "..."
-        
-        sections.append(f"\n--- {source_label} ---")
-        sections.append(content)
+    # If no facts available, add a note
+    if not web_sources:
+        web_sources.append("### LIMITED INFORMATION\nNo detailed information available from external sources. Please create a brief summary based on the location name and type.")
     
-    # Add context about nearby locations (for landmarks only)
-    if not is_city and item.get('nearby_towns'):
-        nearby = item['nearby_towns'][:3]
-        towns_list = ', '.join([f"{t['name']} ({t['distance_km']}km away)" for t in nearby])
-        sections.append(f"\n--- NEARBY CONTEXT ---")
-        sections.append(f"Near: {towns_list}")
+    web_sources_text = "\n\n".join(web_sources)
     
-    if not is_city and item.get('closest_major_city'):
-        city = item['closest_major_city']
-        sections.append(f"Closest major city: {city['name']} ({city['distance_km']}km away)")
+    # Custom facts is always NULL/N/A as it's user-provided later
+    custom_facts_text = "N/A"
     
-    sections.append("\n" + "="*50)
-    sections.append("INSTRUCTIONS")
-    sections.append("="*50)
-    sections.append("Create a compelling, accurate summary that:")
-    sections.append("1. Highlights the most interesting and unique aspects")
-    sections.append("2. Includes fun and unique facts about the location")
-    sections.append("3. Explains why it's significant or worth visiting")
-    sections.append("4. Avoids human unreadable data such as coordinates")
-    sections.append("5. Draws out any references to anime/manga (such as pilgrimage spots, in-real-life inspiration, etc.) if applicable.")
-    sections.append("6. Keeps a slightly more casual style of writing. This is not supposed to be an academic paper.")
-    sections.append("7. Consists of less than 30 percent history")
-    sections.append("8. Stays under 1024 characters")
+    # Build the complete prompt using the new template format
+    prompt = f"""# Instructions
+You are tasked with creating a comprehensive and fun-to-read summary of the the following location: {name}. Any references to the location should use this name, and not ones stated in the **sources** section.
+Below you have been given facts from a variety of sources which you can use to enrich your summary.
+
+# Location Details
+- Name: {name}
+- Type: {location_type}
+- Prefecture: {prefecture}, Japan
+
+# Sources
+Web sources is data parsed from websites. Custom sources is information provided by a user. You should assume everything provided below is a fact.
+
+## Web sources
+{web_sources_text}
+
+## Custom facts
+{custom_facts_text}
+
+# Rules
+Your summary should adhere to the following rules:
+1. Highlight the most interesting and unique aspects
+2. Include fun and unique facts about the location
+3. Explain why it's significant and/or worth visiting
+4. Avoid human unreadable data such as coordinates in your reply
+5. Draw out any references to anime/manga (such as pilgrimage spots, in-real-life inspiration, etc.) if applicable.
+6. Keep a more casual style of writing. This is not supposed to be an academic paper.
+7. Keep historical elements brief. Only highlight major events. Your summary should always be <30% history.
+8. Stay under 1024 characters"""
     
-    return '\n'.join(sections)
+    return prompt
 
 async def enrich_landmarks_with_facts(
     landmarks: List[Dict],
